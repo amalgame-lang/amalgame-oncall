@@ -1,0 +1,805 @@
+// amalgame-oncall — on-call paging : who is on call, how an incident
+// reaches them, and the proof that it did.
+//
+// The proof of reach is the take-over, not the send : an incident
+// escalates step by step (after how long, to whom, by which channels)
+// until someone takes it. Every push carries a random id that the phone
+// sends back when the notification arrives (a delivery receipt) ; a push
+// not received within fallback_s goes again by SMS and mail to the same
+// person without waiting for the next step. Every push carries a take
+// token (HMAC, one incident, one person, limited in time) : the person
+// paged takes the incident from the lock screen, without a session.
+// Phones are tested periodically (a test push must come back) : a dead
+// subscription is known the same day, not during an incident.
+//
+// Storage-agnostic : the caller gives the incidents (Tick), the devices
+// (AddDevice, at start and when a phone subscribes), and journals the
+// events the pager returns (Drain) ; Restore replays what was already
+// sent after a restart. Channels : Web Push (amalgame-net-webpush), SMS
+// (amalgame-net-sms), mail (amalgame-net-smtp). The service worker for
+// the phone is web/oncall-sw.js.
+namespace Amalgame.OnCall
+
+import Amalgame.Collections
+import Amalgame.String
+import Amalgame.Crypto
+import Amalgame.Threading
+import Amalgame.DateTime
+import Amalgame.Formats.Json
+import Amalgame.Net.WebPush
+import Amalgame.Net.Sms
+import Amalgame.Net.Smtp
+
+// ── Policy (JSON) ────────────────────────────────────────────────
+//
+// {
+//   "levels": ["crit"],                       which incident levels page
+//   "steps": [ {"after_s": 0,    "to": "oncall",  "via": ["push"]},
+//              {"after_s": 300,  "to": "oncall",  "via": ["push", "sms"]},
+//              {"after_s": 600,  "to": "backup",  "via": ["push", "sms", "mail"]},
+//              {"after_s": 1200, "to": "manager", "via": ["sms", "mail"]} ],
+//   "fallback_s": 60,                          push not received : SMS + mail now
+//   "test_every_s": 86400,                     test push to oncall and backup
+//   "rota": [ {"from": "2026-11-16T07:00:00Z", "oncall": "karim", "backup": "marie", "manager": "paul"} ],
+//   "contacts": {"karim": {"phone": "06 12 34 56 78", "email": "karim@example.com"}},
+//   "country": "33",                           for national phone numbers
+//   "public_url": "https://scada.example:8765", in SMS and mail links
+//   "sms_prefix": "Kairos",
+//   "sms": {"kind": "sms-gate", "url": "http://127.0.0.1:8080", "user": "...", "password": "..."}
+//          or {"kind": "twilio", "sid": "...", "token": "...", "from": "+1..."}
+//          or {"kind": "template", "method": "POST", "url": "...", "content_type": "...", "body": "...", "user": "", "password": ""},
+//   "smtp": {"host": "ssl0.example.net", "port": 465, "user": "...", "password": "...", "from": "astreinte@example.com"}
+// }
+//
+// "to" is a role of the current rota entry (the last one whose "from",
+// UTC, is past) or a login. Times in rota entries : RFC 3339 UTC ("Z").
+
+public class OnCallStep {
+    public AfterS: int
+    public To: string
+    public Via: List<string>
+
+    public OnCallStep(afterS: int, to: string) {
+        this.AfterS = afterS
+        this.To = to
+        this.Via = new List<string>()
+    }
+
+    public bool Has(channel: string) {
+        for v in this.Via {
+            let s: string = v
+            if (s == channel) { return true }
+        }
+        return false
+    }
+}
+
+public class OnCallPolicy {
+    public Levels: List<string>
+    public Steps: List<OnCallStep>
+    public FallbackS: int
+    public TestEveryS: int
+    public RotaFrom: List<string>      // ms, as strings (List<int> loops are untyped)
+    public Rota: List<JsonValue>
+    public Contacts: JsonValue
+    public Country: string
+    public PublicUrl: string
+    public SmsPrefix: string
+    public Sms: SmsGateway
+    public SmtpHost: string
+    public SmtpPort: int
+    public SmtpUser: string
+    public SmtpPassword: string
+    public SmtpFrom: string
+    public Errors: List<string>
+
+    public OnCallPolicy() {
+        this.Levels = new List<string>()
+        this.Steps = new List<OnCallStep>()
+        this.FallbackS = 60
+        this.TestEveryS = 0
+        this.RotaFrom = new List<string>()
+        this.Rota = new List<JsonValue>()
+        this.Contacts = null
+        this.Country = ""
+        this.PublicUrl = ""
+        this.SmsPrefix = ""
+        this.Sms = null
+        this.SmtpHost = ""
+        this.SmtpPort = 465
+        this.SmtpUser = ""
+        this.SmtpPassword = ""
+        this.SmtpFrom = ""
+        this.Errors = new List<string>()
+    }
+
+    public static OnCallPolicy Parse(text: string) {
+        let p: OnCallPolicy = new OnCallPolicy()
+        let r: JsonResult = Json.Parse(text)
+        if (!r.Ok) {
+            p.Errors.Add("not JSON")
+            return p
+        }
+        let root: JsonValue = r.Value
+        let lv: JsonValue = root.Get("levels")
+        let nl: int = lv.Length()
+        for i in 0..nl {
+            let x: JsonValue = lv.At(i)
+            p.Levels.Add(x.AsString())
+        }
+        let st: JsonValue = root.Get("steps")
+        let ns: int = st.Length()
+        for i in 0..ns {
+            let x: JsonValue = st.At(i)
+            let a: JsonValue = x.Get("after_s")
+            let t: JsonValue = x.Get("to")
+            let step: OnCallStep = new OnCallStep(a.AsInt(), t.AsString())
+            let via: JsonValue = x.Get("via")
+            let nv: int = via.Length()
+            for j in 0..nv {
+                let c: JsonValue = via.At(j)
+                let cs: string = c.AsString()
+                if (cs == "push" || cs == "sms" || cs == "mail") { step.Via.Add(cs) }
+                else { p.Errors.Add("step " + String.FromInt(i) + " : unknown channel " + cs) }
+            }
+            if (String.Length(step.To) == 0) { p.Errors.Add("step " + String.FromInt(i) + " : no \"to\"") }
+            if (step.AfterS < 0) { p.Errors.Add("step " + String.FromInt(i) + " : after_s < 0") }
+            p.Steps.Add(step)
+        }
+        if (ns == 0) { p.Errors.Add("no step") }
+        let fb: JsonValue = root.Get("fallback_s")
+        if (fb.AsInt() > 0) { p.FallbackS = fb.AsInt() }
+        let te: JsonValue = root.Get("test_every_s")
+        p.TestEveryS = te.AsInt()
+        let rota: JsonValue = root.Get("rota")
+        let nr: int = rota.Length()
+        for i in 0..nr {
+            let e: JsonValue = rota.At(i)
+            let fv: JsonValue = e.Get("from")
+            let ir: InstantResult = Instant.Parse(fv.AsString())
+            if (!ir.Ok) { p.Errors.Add("rota " + String.FromInt(i) + " : \"from\" must be RFC 3339 UTC (2026-11-16T07:00:00Z)") }
+            else {
+                let at: Instant = ir.Value
+                p.RotaFrom.Add(String.FromInt(at.UnixMillis()))
+                p.Rota.Add(e)
+            }
+        }
+        p.Contacts = root.Get("contacts")
+        let cc: JsonValue = root.Get("country")
+        p.Country = cc.AsString()
+        let pu: JsonValue = root.Get("public_url")
+        p.PublicUrl = pu.AsString()
+        let sp: JsonValue = root.Get("sms_prefix")
+        p.SmsPrefix = sp.AsString()
+        let sms: JsonValue = root.Get("sms")
+        let kv: JsonValue = sms.Get("kind")
+        let kind: string = kv.AsString()
+        let su: JsonValue = sms.Get("url")
+        let us: JsonValue = sms.Get("user")
+        let pw: JsonValue = sms.Get("password")
+        if (kind == "sms-gate") { p.Sms = SmsGateway.SmsGate(su.AsString(), us.AsString(), pw.AsString()) }
+        else if (kind == "twilio") {
+            let sid: JsonValue = sms.Get("sid")
+            let tok: JsonValue = sms.Get("token")
+            let fr: JsonValue = sms.Get("from")
+            p.Sms = SmsGateway.Twilio(sid.AsString(), tok.AsString(), fr.AsString())
+        } else if (kind == "template") {
+            let me: JsonValue = sms.Get("method")
+            let ct: JsonValue = sms.Get("content_type")
+            let bd: JsonValue = sms.Get("body")
+            var method: string = me.AsString()
+            if (String.Length(method) == 0) { method = "POST" }
+            p.Sms = SmsGateway.Template(method, su.AsString(), ct.AsString(), bd.AsString())
+            if (String.Length(us.AsString()) > 0) { p.Sms.WithBasicAuth(us.AsString(), pw.AsString()) }
+        } else if (String.Length(kind) > 0) { p.Errors.Add("sms : unknown kind " + kind) }
+        let sm: JsonValue = root.Get("smtp")
+        let sh: JsonValue = sm.Get("host")
+        p.SmtpHost = sh.AsString()
+        let spo: JsonValue = sm.Get("port")
+        if (spo.AsInt() > 0) { p.SmtpPort = spo.AsInt() }
+        let su2: JsonValue = sm.Get("user")
+        p.SmtpUser = su2.AsString()
+        let sp2: JsonValue = sm.Get("password")
+        p.SmtpPassword = sp2.AsString()
+        let sf: JsonValue = sm.Get("from")
+        p.SmtpFrom = sf.AsString()
+        return p
+    }
+
+    public bool Pages(level: string) {
+        for l in this.Levels {
+            let s: string = l
+            if (s == level) { return true }
+        }
+        return false
+    }
+
+    // The login behind a role at nowMs ("" : nobody) ; a "to" that is
+    // not a role of the rota entry is taken as a login.
+    public string Resolve(to: string, nowMs: int) {
+        var best: int = -1
+        var bestFrom: int = -1
+        let n: int = this.Rota.Count()
+        for i in 0..n {
+            let fs: string = this.RotaFrom.Get(i)
+            let f: int = String.ToInt(fs)
+            if (f <= nowMs && f >= bestFrom) {
+                best = i
+                bestFrom = f
+            }
+        }
+        if (best >= 0) {
+            let e: JsonValue = this.Rota.Get(best)
+            let v: JsonValue = e.Get(to)
+            let who: string = v.AsString()
+            if (String.Length(who) > 0) { return who }
+        }
+        if (to == "oncall" || to == "backup" || to == "manager") { return "" }
+        return to
+    }
+
+    public string Contact(login: string, field: string) {
+        if (this.Contacts == null) { return "" }
+        let c: JsonValue = this.Contacts.Get(login)
+        if (c == null) { return "" }
+        let v: JsonValue = c.Get(field)
+        if (v == null) { return "" }
+        return v.AsString()
+    }
+}
+
+// ── Devices, incidents, events ───────────────────────────────────
+
+public class OnCallDevice {
+    public Login: string
+    public Endpoint: string
+    public P256dh: string
+    public Auth: string
+    public Name: string
+    public AddedMs: int
+    public LastRxMs: int
+
+    public OnCallDevice(login: string, endpoint: string, p256dh: string, auth: string, name: string, addedMs: int) {
+        this.Login = login
+        this.Endpoint = endpoint
+        this.P256dh = p256dh
+        this.Auth = auth
+        this.Name = name
+        this.AddedMs = addedMs
+        this.LastRxMs = 0
+    }
+}
+
+public class Incident {
+    public Key: string        // stable for the incident ("site|rule|since")
+    public Level: string
+    public Title: string      // what happens ("La pompe P2 est en défaut.")
+    public Body: string       // where, since when
+    public Url: string        // path of the page that shows it ("/ui/astreinte.html#...")
+    public StartMs: int
+    public TakenBy: string    // login once taken, "" before
+
+    public Incident(key: string, level: string, title: string, body: string, url: string, startMs: int) {
+        this.Key = key
+        this.Level = level
+        this.Title = title
+        this.Body = body
+        this.Url = url
+        this.StartMs = startMs
+        this.TakenBy = ""
+    }
+}
+
+// kind : page (a send, any channel), rx (a push arrived), taken (the
+// paged were told who took it), device-expired (the push service
+// dropped the subscription : delete it), test, test-ok, test-failed.
+public class OnCallEvent {
+    public Kind: string
+    public Key: string
+    public Login: string
+    public Detail: string     // JSON object
+    public Ms: int
+
+    public OnCallEvent(kind: string, key: string, login: string, detail: string, ms: int) {
+        this.Kind = kind
+        this.Key = key
+        this.Login = login
+        this.Detail = detail
+        this.Ms = ms
+    }
+}
+
+public class TakeResult {
+    public Ok: bool
+    public Login: string
+    public Key: string
+    public Error: string
+
+    public TakeResult() {
+        this.Ok = false
+        this.Login = ""
+        this.Key = ""
+        this.Error = ""
+    }
+}
+
+// ── Pager ────────────────────────────────────────────────────────
+
+public class Pager {
+    public Policy: OnCallPolicy
+    public VapidKey: string      // PEM PKCS#8, P-256
+    public VapidPub: string      // base64url, 65 bytes
+    public Subject: string       // "mailto:..." or the site URL (RFC 8292)
+    public Secret: string        // key of the take tokens
+    public RxUrl: string         // where the phone confirms a push arrived
+    public TakeUrl: string       // where the phone posts a take token
+    public TakeLabel: string
+    public OpenLabel: string
+    public TakenPrefix: string   // + name : the notification that replaces the alarm
+    public TestTitle: string
+    public TestBody: string
+    public DeadPhoneSms: string  // + device name : SMS when a test push did not arrive
+    public TokenMs: int          // validity of a take token
+    public StartedMs: int
+    public Devices: List<OnCallDevice>
+    public Names: Map<string, string>
+    public Allowed: List<string>
+    public Mu: AmalgameMutex
+    public Done: Map<string, string>
+    public Pend: Map<string, List<string>>    // push id -> [key, login, sentMs, kind, device name]
+    public Rx: Map<string, string>            // push id, "key|login" -> ms
+    public Paged: Map<string, string>         // key -> ",login,login,"
+    public Events: List<OnCallEvent>
+    public LastAutoTest: int
+
+    public Pager(policy: OnCallPolicy, vapidKey: string, vapidPub: string, subject: string, secret: string, nowMs: int) {
+        this.Policy = policy
+        this.VapidKey = vapidKey
+        this.VapidPub = vapidPub
+        this.Subject = subject
+        this.Secret = secret
+        this.RxUrl = "/api/oncall/rx"
+        this.TakeUrl = "/api/oncall/take"
+        this.TakeLabel = "Take it"
+        this.OpenLabel = "Open"
+        this.TakenPrefix = "Taken by "
+        this.TestTitle = "On-call test"
+        this.TestBody = "This phone receives the on-call alerts."
+        this.DeadPhoneSms = "On-call : a test notification did not reach your phone : "
+        this.TokenMs = 6 * 3600000
+        this.StartedMs = nowMs
+        this.Devices = new List<OnCallDevice>()
+        this.Names = new Map<string, string>()
+        this.Allowed = new List<string>()
+        this.Mu = Threading.MutexNew()
+        this.Done = new Map<string, string>()
+        this.Pend = new Map<string, List<string>>()
+        this.Rx = new Map<string, string>()
+        this.Paged = new Map<string, string>()
+        this.Events = new List<OnCallEvent>()
+        this.LastAutoTest = nowMs
+    }
+
+    public static string B(b: bool) {
+        if (b) { return "true" }
+        return "false"
+    }
+
+    public static string J(s: string) {
+        return "\"" + SmsEscape.Json(s) + "\""
+    }
+
+    public string NameOf(login: string) {
+        if (this.Names.Has(login)) { return this.Names.Get(login) }
+        return login
+    }
+
+    // ── Devices ──
+
+    // The push services of the browsers (Chrome / Android, Firefox,
+    // Safari / iOS, Edge / Windows). Anything else is refused : the
+    // server POSTs to the endpoint, so a free endpoint would let any
+    // user make it call an internal address.
+    public static bool KnownPushService(url: string) {
+        if (!String.StartsWith(url, "https://")) { return false }
+        let rest: string = String.Substring(url, 8, String.Length(url) - 8)
+        var host: string = rest
+        let slash: int = String.IndexOf(rest, "/")
+        if (slash >= 0) { host = String.Substring(rest, 0, slash) }
+        if (String.Contains(host, ":") || String.Contains(host, "@")) { return false }
+        return host == "fcm.googleapis.com" || host == "updates.push.services.mozilla.com" || host == "push.services.mozilla.com"
+            || host == "web.push.apple.com" || String.EndsWith(host, ".notify.windows.com")
+    }
+
+    // An extra endpoint prefix to accept (a test push service).
+    public void AllowPrefix(prefix: string) {
+        this.Allowed.Add(prefix)
+    }
+
+    public bool EndpointAllowed(url: string) {
+        if (Pager.KnownPushService(url)) { return true }
+        for a in this.Allowed {
+            let p: string = a
+            if (String.StartsWith(url, p)) { return true }
+        }
+        return false
+    }
+
+    // "" when added ; else why not. A device with the same endpoint is
+    // replaced ; 5 devices per person at most.
+    public string AddDevice(login: string, endpoint: string, p256dh: string, auth: string, name: string, nowMs: int) {
+        if (!this.EndpointAllowed(endpoint)) { return "endpoint is not a known push service" }
+        if (Bytes.FromBase64Url(p256dh).Count() != 65 || Bytes.FromBase64Url(auth).Count() != 16) { return "p256dh must be 65 bytes and auth 16 (base64url)" }
+        Threading.MutexLock(this.Mu)
+        let keep: List<OnCallDevice> = new List<OnCallDevice>()
+        var mine: int = 0
+        for d in this.Devices {
+            let ep: string = d.Endpoint
+            let lg: string = d.Login
+            if (ep != endpoint) {
+                keep.Add(d)
+                if (lg == login) { mine = mine + 1 }
+            }
+        }
+        if (mine >= 5) {
+            Threading.MutexUnlock(this.Mu)
+            return "5 devices at most per person : remove one first"
+        }
+        keep.Add(new OnCallDevice(login, endpoint, p256dh, auth, name, nowMs))
+        this.Devices = keep
+        Threading.MutexUnlock(this.Mu)
+        return ""
+    }
+
+    public bool RemoveDevice(login: string, endpoint: string) {
+        Threading.MutexLock(this.Mu)
+        let keep: List<OnCallDevice> = new List<OnCallDevice>()
+        var removed: bool = false
+        for d in this.Devices {
+            let ep: string = d.Endpoint
+            let lg: string = d.Login
+            if (ep == endpoint && (lg == login || String.Length(login) == 0)) { removed = true } else { keep.Add(d) }
+        }
+        this.Devices = keep
+        Threading.MutexUnlock(this.Mu)
+        return removed
+    }
+
+    public List<OnCallDevice> DevicesOf(login: string) {
+        Threading.MutexLock(this.Mu)
+        let out: List<OnCallDevice> = new List<OnCallDevice>()
+        for d in this.Devices {
+            let lg: string = d.Login
+            if (lg == login || String.Length(login) == 0) { out.Add(d) }
+        }
+        Threading.MutexUnlock(this.Mu)
+        return out
+    }
+
+    // ── Events ──
+
+    public void Emit(kind: string, key: string, login: string, detail: string, ms: int) {
+        Threading.MutexLock(this.Mu)
+        this.Events.Add(new OnCallEvent(kind, key, login, detail, ms))
+        Threading.MutexUnlock(this.Mu)
+    }
+
+    // The events since the last call, oldest first : journal them.
+    public List<OnCallEvent> Drain() {
+        Threading.MutexLock(this.Mu)
+        let out: List<OnCallEvent> = this.Events
+        this.Events = new List<OnCallEvent>()
+        Threading.MutexUnlock(this.Mu)
+        return out
+    }
+
+    // ── Take tokens ──
+
+    public string Mac(payload: string) {
+        return Hmac.Sha256OfStrings(this.Secret, "oncall-take|" + payload)
+    }
+
+    // login|key|expMs|mac (the key may itself contain "|").
+    public string Token(login: string, key: string, expMs: int) {
+        let p: string = login + "|" + key + "|" + String.FromInt(expMs)
+        return p + "|" + this.Mac(p)
+    }
+
+    public TakeResult Verify(token: string, nowMs: int) {
+        let r: TakeResult = new TakeResult()
+        let parts: List<string> = String.Split(token, "|")
+        let n: int = parts.Count()
+        if (n < 4) {
+            r.Error = "malformed token"
+            return r
+        }
+        let mac: string = parts.Get(n - 1)
+        let exp: string = parts.Get(n - 2)
+        let login: string = parts.Get(0)
+        let keyParts: List<string> = new List<string>()
+        let last: int = n - 2
+        for i in 1..last {
+            let kp: string = parts.Get(i)
+            keyParts.Add(kp)
+        }
+        let key: string = String.Join(keyParts, "|")
+        let want: string = this.Mac(login + "|" + key + "|" + exp)
+        if (!Bytes.ConstantTimeEquals(Bytes.FromString(mac), Bytes.FromString(want))) {
+            r.Error = "bad signature"
+            return r
+        }
+        if (String.ToInt(exp) < nowMs) {
+            r.Error = "expired"
+            return r
+        }
+        r.Ok = true
+        r.Login = login
+        r.Key = key
+        return r
+    }
+
+    // ── Channels ──
+
+    public string NewId() {
+        return Bytes.ToHex(WpBytes.Rand16())
+    }
+
+    // One push to every device of login. kind : alarm, taken, test.
+    // Returns the number the push services accepted.
+    public int PushTo(login: string, kind: string, key: string, title: string, body: string, url: string, step: int, nowMs: int) {
+        var ok: int = 0
+        let devs: List<OnCallDevice> = this.DevicesOf(login)
+        for d in devs {
+            let id: string = this.NewId()
+            var take: string = ""
+            if (kind == "alarm") {
+                take = ",\"take\":" + Pager.J(this.Token(login, key, nowMs + this.TokenMs)) + ",\"takeUrl\":" + Pager.J(this.TakeUrl) + ",\"takeLabel\":" + Pager.J(this.TakeLabel)
+            }
+            var tag: string = key
+            if (kind == "test") { tag = "oncall-test" }
+            let payload: string = "{\"id\":" + Pager.J(id) + ",\"kind\":" + Pager.J(kind) + ",\"tag\":" + Pager.J(tag)
+                + ",\"title\":" + Pager.J(title) + ",\"body\":" + Pager.J(body) + ",\"url\":" + Pager.J(url)
+                + ",\"rx\":" + Pager.J(this.RxUrl) + ",\"openLabel\":" + Pager.J(this.OpenLabel) + take + "}"
+            let sub: PushSubscription = new PushSubscription(d.Endpoint, d.P256dh, d.Auth)
+            let res: WebPushResult = WebPush.Send(sub, payload, this.VapidKey, this.VapidPub, this.Subject)
+            let code: int = res.StatusCode
+            let dn: string = d.Name
+            if (res.Ok) {
+                ok = ok + 1
+                let pv: List<string> = new List<string>()
+                pv.Add(key)
+                pv.Add(login)
+                pv.Add(String.FromInt(nowMs))
+                pv.Add(kind)
+                pv.Add(dn)
+                Threading.MutexLock(this.Mu)
+                this.Pend.Set(id, pv)
+                Threading.MutexUnlock(this.Mu)
+            }
+            if (code == 404 || code == 410) {
+                this.RemoveDevice(login, d.Endpoint)
+                this.Emit("device-expired", key, login, "{\"device\":" + Pager.J(dn) + ",\"endpoint\":" + Pager.J(d.Endpoint) + ",\"code\":" + String.FromInt(code) + "}", nowMs)
+            }
+            var evKind: string = "page"
+            if (kind == "test") { evKind = "test" }
+            this.Emit(evKind, key, login, "{\"step\":" + String.FromInt(step) + ",\"to\":" + Pager.J(login) + ",\"via\":\"push\",\"kind\":" + Pager.J(kind)
+                + ",\"device\":" + Pager.J(dn) + ",\"ok\":" + Pager.B(res.Ok) + ",\"code\":" + String.FromInt(code) + ",\"id\":" + Pager.J(id) + "}", nowMs)
+        }
+        return ok
+    }
+
+    public bool SmsTo(login: string, text: string, key: string, step: int, fallback: bool, nowMs: int) {
+        let phone: string = Phone.E164(this.Policy.Contact(login, "phone"), this.Policy.Country)
+        var ok: bool = false
+        var code: int = -1
+        var err: string = ""
+        var id: string = ""
+        if (this.Policy.Sms == null) { err = "no SMS gateway" }
+        else if (String.Length(phone) == 0) { err = "no phone number" }
+        else {
+            let r: SmsResult = this.Policy.Sms.Send(phone, SmsText.Fit(text, 1))
+            ok = r.Ok
+            code = r.StatusCode
+            err = r.Error
+            id = r.Id
+        }
+        this.Emit("page", key, login, "{\"step\":" + String.FromInt(step) + ",\"to\":" + Pager.J(login) + ",\"via\":\"sms\",\"fallback\":" + Pager.B(fallback)
+            + ",\"phone\":" + Pager.J(phone) + ",\"ok\":" + Pager.B(ok) + ",\"code\":" + String.FromInt(code) + ",\"id\":" + Pager.J(id) + ",\"error\":" + Pager.J(err) + "}", nowMs)
+        return ok
+    }
+
+    public bool MailTo(login: string, subject: string, body: string, key: string, step: int, fallback: bool, nowMs: int) {
+        let to: string = this.Policy.Contact(login, "email")
+        var ok: bool = false
+        var err: string = ""
+        if (String.Length(this.Policy.SmtpHost) == 0) { err = "no SMTP server" }
+        else if (String.Length(to) == 0) { err = "no email address" }
+        else {
+            ok = Smtp.Send(this.Policy.SmtpHost, this.Policy.SmtpPort, this.Policy.SmtpUser, this.Policy.SmtpPassword, this.Policy.SmtpFrom, to, subject, body)
+            if (!ok) { err = Smtp.LastError() }
+        }
+        this.Emit("page", key, login, "{\"step\":" + String.FromInt(step) + ",\"to\":" + Pager.J(login) + ",\"via\":\"mail\",\"fallback\":" + Pager.B(fallback)
+            + ",\"email\":" + Pager.J(to) + ",\"ok\":" + Pager.B(ok) + ",\"error\":" + Pager.J(err) + "}", nowMs)
+        return ok
+    }
+
+    public string SmsLine(inc: Incident) {
+        var prefix: string = ""
+        if (String.Length(this.Policy.SmsPrefix) > 0) { prefix = this.Policy.SmsPrefix + " : " }
+        var link: string = ""
+        if (String.Length(this.Policy.PublicUrl) > 0) { link = " " + this.Policy.PublicUrl + inc.Url }
+        return prefix + inc.Title + link + " " + inc.Body
+    }
+
+    public void Fallback(inc: Incident, login: string, step: int, nowMs: int) {
+        this.Done.Set("fb|" + inc.Key + "|" + login, "1")
+        this.SmsTo(login, this.SmsLine(inc), inc.Key, step, true, nowMs)
+        this.MailTo(login, inc.Title, inc.Title + "\n" + inc.Body + "\n" + this.Policy.PublicUrl + inc.Url, inc.Key, step, true, nowMs)
+    }
+
+    // One escalation step for one incident.
+    public void Page(inc: Incident, step: int, nowMs: int) {
+        let s: OnCallStep = this.Policy.Steps.Get(step)
+        let login: string = this.Policy.Resolve(s.To, nowMs)
+        if (String.Length(login) == 0) {
+            this.Emit("page", inc.Key, "", "{\"step\":" + String.FromInt(step) + ",\"to\":" + Pager.J(s.To) + ",\"ok\":false,\"error\":\"nobody in this role on the rota\"}", nowMs)
+            return
+        }
+        var paged: string = ","
+        if (this.Paged.Has(inc.Key)) { paged = this.Paged.Get(inc.Key) }
+        if (!String.Contains(paged, "," + login + ",")) { this.Paged.Set(inc.Key, paged + login + ",") }
+        var pushed: int = 0
+        if (s.Has("push")) {
+            pushed = this.PushTo(login, "alarm", inc.Key, inc.Title, inc.Body, inc.Url, step, nowMs)
+        }
+        if (s.Has("sms")) { this.SmsTo(login, this.SmsLine(inc), inc.Key, step, false, nowMs) }
+        if (s.Has("mail")) { this.MailTo(login, inc.Title, inc.Title + "\n" + inc.Body + "\n" + this.Policy.PublicUrl + inc.Url, inc.Key, step, false, nowMs) }
+        // A push that could not leave (no device, push service refused) : SMS and mail now.
+        if (s.Has("push") && pushed == 0 && !s.Has("sms") && !this.Done.Has("fb|" + inc.Key + "|" + login)) {
+            this.Fallback(inc, login, step, nowMs)
+        }
+    }
+
+    // A test push to every device of login ; a test that does not come
+    // back within fallback_s is reported (test-failed) and the person
+    // told by SMS. Returns the number of pushes sent.
+    public int Test(login: string, nowMs: int) {
+        return this.PushTo(login, "test", "test|" + login + "|" + String.FromInt(nowMs), this.TestTitle, this.TestBody, "", -1, nowMs)
+    }
+
+    // The phone says a push arrived. false : unknown id.
+    public bool Receipt(id: string, nowMs: int) {
+        Threading.MutexLock(this.Mu)
+        if (!this.Pend.Has(id)) {
+            Threading.MutexUnlock(this.Mu)
+            return false
+        }
+        let pv: List<string> = this.Pend.Get(id)
+        let key: string = pv.Get(0)
+        let login: string = pv.Get(1)
+        let sent: string = pv.Get(2)
+        let kind: string = pv.Get(3)
+        let dn: string = pv.Get(4)
+        let first: bool = !this.Rx.Has(id)
+        this.Rx.Set(id, String.FromInt(nowMs))
+        this.Rx.Set(key + "|" + login, String.FromInt(nowMs))
+        for d in this.Devices {
+            let lg: string = d.Login
+            let n: string = d.Name
+            if (lg == login && n == dn) { d.LastRxMs = nowMs }
+        }
+        Threading.MutexUnlock(this.Mu)
+        if (first) {
+            let delay: int = nowMs - String.ToInt(sent)
+            var ev: string = "rx"
+            if (kind == "test") { ev = "test-ok" }
+            this.Emit(ev, key, login, "{\"id\":" + Pager.J(id) + ",\"kind\":" + Pager.J(kind) + ",\"device\":" + Pager.J(dn) + ",\"after_ms\":" + String.FromInt(delay) + "}", nowMs)
+        }
+        return true
+    }
+
+    // After a restart : what the journal says was already done.
+    public void Restore(key: string, step: int, login: string) {
+        this.Done.Set(key + "|" + String.FromInt(step), "1")
+        if (String.Length(login) > 0) {
+            var paged: string = ","
+            if (this.Paged.Has(key)) { paged = this.Paged.Get(key) }
+            if (!String.Contains(paged, "," + login + ",")) { this.Paged.Set(key, paged + login + ",") }
+        }
+    }
+
+    public void RestoreFallback(key: string, login: string) {
+        this.Done.Set("fb|" + key + "|" + login, "1")
+    }
+
+    public void RestoreTaken(key: string) {
+        this.Done.Set("taken|" + key, "1")
+    }
+
+    // Every few seconds, with the open incidents : escalation steps that
+    // are due, SMS fallbacks for pushes that did not arrive, the paged
+    // told who took an incident, periodic phone tests.
+    public void Tick(incidents: List<Incident>, nowMs: int) {
+        let open: Map<string, Incident> = new Map<string, Incident>()
+        for inc in incidents {
+            let key: string = inc.Key
+            let taken: string = inc.TakenBy
+            if (String.Length(taken) > 0) {
+                if (this.Paged.Has(key) && !this.Done.Has("taken|" + key)) {
+                    this.Done.Set("taken|" + key, "1")
+                    let logins: List<string> = String.Split(this.Paged.Get(key), ",")
+                    for l in logins {
+                        let lg: string = l
+                        if (String.Length(lg) > 0) {
+                            this.PushTo(lg, "taken", key, this.TakenPrefix + this.NameOf(taken), inc.Title, inc.Url, -1, nowMs)
+                        }
+                    }
+                    this.Emit("taken", key, taken, "{\"by\":" + Pager.J(taken) + ",\"told\":" + Pager.J(this.Paged.Get(key)) + "}", nowMs)
+                }
+            } else if (this.Policy.Pages(inc.Level)) {
+                open.Set(key, inc)
+                var t0: int = inc.StartMs
+                if (t0 < this.StartedMs) { t0 = this.StartedMs }
+                let ns: int = this.Policy.Steps.Count()
+                for i in 0..ns {
+                    let s: OnCallStep = this.Policy.Steps.Get(i)
+                    let dk: string = key + "|" + String.FromInt(i)
+                    if (nowMs - t0 >= s.AfterS * 1000 && !this.Done.Has(dk)) {
+                        this.Done.Set(dk, "1")
+                        this.Page(inc, i, nowMs)
+                    }
+                }
+            }
+        }
+        // Pushes not received in time.
+        Threading.MutexLock(this.Mu)
+        let ids: List<string> = this.Pend.Keys()
+        let late: List<List<string>> = new List<List<string>>()
+        for idv in ids {
+            let id: string = idv
+            let pv: List<string> = this.Pend.Get(id)
+            let key: string = pv.Get(0)
+            let login: string = pv.Get(1)
+            let sent: int = String.ToInt(pv.Get(2))
+            let kind: string = pv.Get(3)
+            if (nowMs - sent >= this.Policy.FallbackS * 1000 && !this.Rx.Has(key + "|" + login)) {
+                let row: List<string> = new List<string>()
+                row.Add(id)
+                row.Add(key)
+                row.Add(login)
+                row.Add(kind)
+                row.Add(pv.Get(4))
+                late.Add(row)
+            }
+            if (nowMs - sent > 86400000) {
+                this.Pend.Remove(id)
+                this.Rx.Remove(id)
+            }
+        }
+        Threading.MutexUnlock(this.Mu)
+        for row in late {
+            let id: string = row.Get(0)
+            let key: string = row.Get(1)
+            let login: string = row.Get(2)
+            let kind: string = row.Get(3)
+            let dn: string = row.Get(4)
+            if (kind == "alarm" && open.Has(key) && !this.Done.Has("fb|" + key + "|" + login)) {
+                let inc: Incident = open.Get(key)
+                this.Fallback(inc, login, -1, nowMs)
+            }
+            if (kind == "test" && !this.Done.Has("tf|" + key)) {
+                this.Done.Set("tf|" + key, "1")
+                this.Emit("test-failed", key, login, "{\"id\":" + Pager.J(id) + ",\"device\":" + Pager.J(dn) + "}", nowMs)
+                this.SmsTo(login, this.DeadPhoneSms + dn, key, -1, true, nowMs)
+            }
+        }
+        // Periodic phone tests : on call and backup.
+        if (this.Policy.TestEveryS > 0 && nowMs - this.LastAutoTest >= this.Policy.TestEveryS * 1000) {
+            this.LastAutoTest = nowMs
+            let a: string = this.Policy.Resolve("oncall", nowMs)
+            let b: string = this.Policy.Resolve("backup", nowMs)
+            if (String.Length(a) > 0) { this.Test(a, nowMs) }
+            if (String.Length(b) > 0 && b != a) { this.Test(b, nowMs) }
+        }
+    }
+}

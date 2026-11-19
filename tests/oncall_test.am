@@ -1,0 +1,212 @@
+// amalgame-oncall test : a whole escalation against stand-in services
+// (tests/fake_services.py : a push service that checks VAPID and
+// decrypts each push with the phone's key, and an SMS gateway).
+// Time is simulated : Tick gets T0 + offsets.
+//   oncall_test <port> <dir> <vapid.key> <vapid.pub>
+namespace OnCallTest
+
+import Amalgame.OnCall
+import Amalgame.Collections
+import Amalgame.String
+import Amalgame.Console
+import Amalgame.IO
+import Amalgame.DateTime
+import Amalgame.Formats.Json
+
+public class Program {
+    public static void Check(name: string, ok: bool) {
+        if (ok) { Console.WriteLine("[PASS] " + name) } else { Console.WriteLine("[FAIL] " + name) }
+    }
+
+    // Events of a kind (and via, when not "") in a drained list.
+    public static int Count(evs: List<OnCallEvent>, kind: string, via: string, login: string) {
+        var n: int = 0
+        for e in evs {
+            let k: string = e.Kind
+            let l: string = e.Login
+            let d: string = e.Detail
+            if (k == kind && (String.Length(via) == 0 || String.Contains(d, "\"via\":\"" + via + "\"")) && (String.Length(login) == 0 || l == login)) { n = n + 1 }
+        }
+        return n
+    }
+
+    public static string Det(evs: List<OnCallEvent>, i: int) {
+        if (i >= evs.Count()) { return "" }
+        let e: OnCallEvent = evs.Get(i)
+        return e.Detail
+    }
+
+    public static List<JsonValue> Lines(path: string) {
+        let out: List<JsonValue> = new List<JsonValue>()
+        for l in String.Split(File_ReadAll(path), "\n") {
+            let s: string = l
+            if (String.Length(s) > 2) {
+                let r: JsonResult = Json.Parse(s)
+                if (r.Ok) { out.Add(r.Value) }
+            }
+        }
+        return out
+    }
+
+    public static string S(v: JsonValue, k: string) {
+        let x: JsonValue = v.Get(k)
+        return x.AsString()
+    }
+
+    public static void Main(string[] args) {
+        if (Args_Count() < 5) {
+            Console.WriteLine("[FAIL] usage : oncall_test <port> <dir> <vapid.key> <vapid.pub>")
+            return
+        }
+        let port: string = Args_Get(1)
+        let dir: string = Args_Get(2)
+        let vkey: string = File_ReadAll(Args_Get(3))
+        let vpub: string = String.Trim(File_ReadAll(Args_Get(4)))
+        let base: string = "http://127.0.0.1:" + port
+        let now: Instant = Instant.Now()
+        let t0: int = now.UnixMillis()
+
+        let policyText: string = "{\"levels\":[\"crit\"],"
+            + "\"steps\":[{\"after_s\":0,\"to\":\"oncall\",\"via\":[\"push\"]},"
+            + "{\"after_s\":300,\"to\":\"oncall\",\"via\":[\"push\",\"sms\"]},"
+            + "{\"after_s\":600,\"to\":\"backup\",\"via\":[\"push\",\"sms\",\"mail\"]},"
+            + "{\"after_s\":1200,\"to\":\"manager\",\"via\":[\"sms\"]}],"
+            + "\"fallback_s\":60,\"test_every_s\":3600,"
+            + "\"rota\":[{\"from\":\"2026-01-01T00:00:00Z\",\"oncall\":\"karim\",\"backup\":\"marie\",\"manager\":\"paul\"},"
+            + "{\"from\":\"2099-01-01T00:00:00Z\",\"oncall\":\"nobody\"}],"
+            + "\"contacts\":{\"karim\":{\"phone\":\"06 11 11 11 11\"},\"marie\":{\"phone\":\"06.22.22.22.22\"},\"paul\":{\"phone\":\"+33 6 33 33 33 33\"}},"
+            + "\"country\":\"33\",\"public_url\":\"https://scada.example\",\"sms_prefix\":\"Kairos\","
+            + "\"sms\":{\"kind\":\"sms-gate\",\"url\":\"" + base + "\",\"user\":\"sms\",\"password\":\"secret\"}}"
+        let pol: OnCallPolicy = OnCallPolicy.Parse(policyText)
+        Program.Check("policy : no error (" + String.Join(pol.Errors, " ; ") + ")", pol.Errors.Count() == 0)
+        Program.Check("rota : oncall is karim now (the 2099 entry is not yet)", pol.Resolve("oncall", t0) == "karim")
+        Program.Check("rota : a login that is not a role is itself", pol.Resolve("paul", t0) == "paul")
+        let bad: OnCallPolicy = OnCallPolicy.Parse("{\"steps\":[{\"after_s\":0,\"to\":\"oncall\",\"via\":[\"pigeon\"]}],\"rota\":[{\"from\":\"2026-01-01 00:00\"}]}")
+        Program.Check("policy : unknown channel and bad date are reported", bad.Errors.Count() == 2)
+
+        let pg: Pager = new Pager(pol, vkey, vpub, "mailto:astreinte@example.com", "test-secret-0123456789abcdef0123456789", t0)
+        pg.Names.Set("karim", "Karim Benali")
+        pg.TakenPrefix = "Pris en charge par "
+        pg.DeadPhoneSms = "Kairos : ton telephone ne recoit pas les alarmes : "
+        let subs: JsonResult = Json.Parse(File_ReadAll(dir + "/subs.json"))
+        let sv: JsonValue = subs.Value
+        let d1: JsonValue = sv.Get("d1")
+        let d2: JsonValue = sv.Get("d2")
+        Program.Check("devices : an endpoint that is not a push service is refused", String.Length(pg.AddDevice("karim", base + "/push/d1", Program.S(d1, "p256dh"), Program.S(d1, "auth"), "Fairphone", t0)) > 0)
+        Program.Check("devices : the browsers' push services are known", Pager.KnownPushService("https://fcm.googleapis.com/fcm/send/abc") && Pager.KnownPushService("https://web.push.apple.com/x") && !Pager.KnownPushService("https://fcm.googleapis.com.evil.net/x") && !Pager.KnownPushService("http://fcm.googleapis.com/x"))
+        pg.AllowPrefix(base + "/push/")
+        Program.Check("devices : karim's phone added", pg.AddDevice("karim", base + "/push/d1", Program.S(d1, "p256dh"), Program.S(d1, "auth"), "Fairphone", t0) == "")
+        Program.Check("devices : a dead subscription added too", pg.AddDevice("karim", base + "/push/gone", Program.S(d2, "p256dh"), Program.S(d2, "auth"), "Old phone", t0) == "")
+        Program.Check("devices : marie's phone added", pg.AddDevice("marie", base + "/push/d2", Program.S(d2, "p256dh"), Program.S(d2, "auth"), "Pixel", t0) == "")
+        Program.Check("devices : bad keys refused", String.Length(pg.AddDevice("paul", base + "/push/d3", "abc", "def", "x", t0)) > 0)
+
+        // ── Incident 1 : taken after the second step ──
+        let i1: Incident = new Incident("pompage|p2_defaut|1000", "crit", "La pompe P2 est en défaut.", "Station de pompage Nord · depuis 10:02", "/ui/astreinte.html#p2", t0)
+        let w1: Incident = new Incident("pompage|p1_debit_faible|1000", "warn", "P1 débite peu.", "Station Nord", "/ui/astreinte.html", t0)
+        let incs: List<Incident> = new List<Incident>()
+        incs.Add(i1)
+        incs.Add(w1)
+        pg.Tick(incs, t0)
+        var ev: List<OnCallEvent> = pg.Drain()
+        Program.Check("t+0 : step 0 pushes to karim's phone (accepted)", Program.Count(ev, "page", "push", "karim") == 2 && String.Contains(Program.Det(ev, 0), "\"ok\":true"))
+        Program.Check("t+0 : the dead subscription is reported (410) and dropped", Program.Count(ev, "device-expired", "", "karim") == 1 && pg.DevicesOf("karim").Count() == 1)
+        Program.Check("t+0 : a warning does not page", ev.Count() == 3)
+        let pushes: List<JsonValue> = Program.Lines(dir + "/push.jsonl")
+        Program.Check("the push arrived once, decrypted by the phone's key (RFC 8291)", pushes.Count() == 1)
+        let p0: JsonValue = pushes.Get(0)
+        let pay: JsonValue = p0.Get("payload")
+        let vo: JsonValue = p0.Get("vapid_ok")
+        Program.Check("the push is signed (VAPID ES256, audience, expiry) and urgent", vo.AsString() == "ok" && Program.S(p0, "urgency") == "high")
+        Program.Check("the push says what happened, with its tag and link", Program.S(pay, "title") == "La pompe P2 est en défaut." && Program.S(pay, "tag") == i1.Key && Program.S(pay, "url") == "/ui/astreinte.html#p2" && Program.S(pay, "kind") == "alarm")
+        let token: string = Program.S(pay, "take")
+        let pushId: string = Program.S(pay, "id")
+        Program.Check("the push carries a take token and a receipt id", String.Length(token) > 64 && String.Length(pushId) == 32)
+
+        pg.Tick(incs, t0 + 30000)
+        ev = pg.Drain()
+        Program.Check("t+30 s : nothing new", ev.Count() == 0)
+        pg.Tick(incs, t0 + 61000)
+        ev = pg.Drain()
+        Program.Check("t+61 s : push not received -> SMS to karim now, without waiting for step 1", Program.Count(ev, "page", "sms", "karim") == 1 && String.Contains(Program.Det(ev, 0), "\"fallback\":true") && String.Contains(Program.Det(ev, 0), "\"ok\":true"))
+        Program.Check("t+61 s : mail fallback reported as impossible (no SMTP), not silent", Program.Count(ev, "page", "mail", "karim") == 1 && String.Contains(Program.Det(ev, 1), "no SMTP server"))
+        let sms: List<JsonValue> = Program.Lines(dir + "/sms.jsonl")
+        let s0: JsonValue = sms.Get(0)
+        Program.Check("the SMS went to karim in E.164, one SMS, with the link", sms.Count() == 1 && Program.S(s0, "to") == "+33611111111" && String.StartsWith(Program.S(s0, "text"), "Kairos : La pompe P2 est en défaut. https://scada.example/ui/astreinte.html#p2"))
+        Program.Check("receipt : the phone confirms the push", pg.Receipt(pushId, t0 + 62000))
+        Program.Check("receipt : an unknown id is refused", !pg.Receipt("00112233445566778899aabbccddeeff", t0 + 62000))
+        ev = pg.Drain()
+        Program.Check("receipt : journaled with the delay", Program.Count(ev, "rx", "", "karim") == 1 && String.Contains(Program.Det(ev, 0), "\"after_ms\":62000"))
+
+        let tr: TakeResult = pg.Verify(token, t0 + 100000)
+        Program.Check("take token : valid, for karim and this incident", tr.Ok && tr.Login == "karim" && tr.Key == i1.Key)
+        let forged: TakeResult = pg.Verify("marie|" + String.Substring(token, 6, String.Length(token) - 6), t0 + 100000)
+        Program.Check("take token : another login in it breaks the signature", !forged.Ok && forged.Error == "bad signature")
+        let old: TakeResult = pg.Verify(token, t0 + 7 * 3600000)
+        Program.Check("take token : expired after 6 h", !old.Ok && old.Error == "expired")
+        let other: Pager = new Pager(pol, vkey, vpub, "mailto:x@example.com", "another-secret-0123456789abcdef01234567", t0)
+        let ot: TakeResult = other.Verify(token, t0 + 100000)
+        Program.Check("take token : another server's secret refuses it", !ot.Ok)
+
+        pg.Tick(incs, t0 + 301000)
+        ev = pg.Drain()
+        Program.Check("t+301 s : step 1 : push and SMS to karim", Program.Count(ev, "page", "push", "karim") == 1 && Program.Count(ev, "page", "sms", "karim") == 1)
+        i1.TakenBy = "karim"
+        pg.Tick(incs, t0 + 302000)
+        ev = pg.Drain()
+        Program.Check("taken : the paged are told who took it", Program.Count(ev, "taken", "", "karim") == 1 && Program.Count(ev, "page", "push", "karim") == 1)
+        let pushes2: List<JsonValue> = Program.Lines(dir + "/push.jsonl")
+        let pl: JsonValue = pushes2.Get(pushes2.Count() - 1)
+        let plp: JsonValue = pl.Get("payload")
+        Program.Check("taken : the notification is replaced (same tag) by \"Pris en charge par Karim Benali\"", Program.S(plp, "kind") == "taken" && Program.S(plp, "title") == "Pris en charge par Karim Benali" && Program.S(plp, "tag") == i1.Key)
+        pg.Tick(incs, t0 + 700000)
+        ev = pg.Drain()
+        Program.Check("taken : no more escalation (backup not paged at t+600 s)", Program.Count(ev, "page", "", "") == 0)
+
+        // ── Incident 2 : never taken, the whole escalation ──
+        let i2: Incident = new Incident("pompage|pression_basse|2000", "crit", "Pression aval basse.", "Station Nord", "/ui/astreinte.html#pr", t0 + 400000)
+        let incs2: List<Incident> = new List<Incident>()
+        incs2.Add(i2)
+        pg.Tick(incs2, t0 + 400000)
+        ev = pg.Drain()
+        Program.Check("I2 t+0 : step 0 push to karim", Program.Count(ev, "page", "push", "karim") == 1)
+        pg.Tick(incs2, t0 + 1000000)
+        ev = pg.Drain()
+        Program.Check("I2 t+600 s : steps 1 and 2 : karim (push, SMS) then marie (push, SMS, mail)", Program.Count(ev, "page", "sms", "karim") >= 1 && Program.Count(ev, "page", "push", "marie") == 1 && Program.Count(ev, "page", "sms", "marie") == 1 && Program.Count(ev, "page", "mail", "marie") == 1)
+        pg.Tick(incs2, t0 + 1600000)
+        ev = pg.Drain()
+        Program.Check("I2 t+1200 s : step 3 : SMS to the manager", Program.Count(ev, "page", "sms", "paul") == 1)
+        let sms2: List<JsonValue> = Program.Lines(dir + "/sms.jsonl")
+        var toPaul: bool = false
+        var toMarie: bool = false
+        for x in sms2 {
+            let to: string = Program.S(x, "to")
+            if (to == "+33633333333") { toPaul = true }
+            if (to == "+33622222222") { toMarie = true }
+        }
+        Program.Check("the SMS reached marie and paul (numbers typed with dots and spaces)", toPaul && toMarie)
+
+        // ── Restart : what the journal says was done is not done again ──
+        let pg2: Pager = new Pager(pol, vkey, vpub, "mailto:x@example.com", "test-secret-0123456789abcdef0123456789", t0)
+        pg2.AllowPrefix(base + "/push/")
+        for i in 0..4 { pg2.Restore(i2.Key, i, "") }
+        pg2.Tick(incs2, t0 + 1700000)
+        ev = pg2.Drain()
+        Program.Check("restart : restored steps are not paged again", Program.Count(ev, "page", "", "") == 0)
+
+        // ── Phone tests ──
+        Program.Check("test : one push to karim's phone", pg.Test("karim", t0 + 2000000) == 1)
+        ev = pg.Drain()
+        pg.Tick(new List<Incident>(), t0 + 2061000)
+        ev = pg.Drain()
+        Program.Check("test : not received in time -> test-failed and an SMS to karim", Program.Count(ev, "test-failed", "", "karim") == 1 && Program.Count(ev, "page", "sms", "karim") == 1)
+        pg.Test("marie", t0 + 2100000)
+        let pushes3: List<JsonValue> = Program.Lines(dir + "/push.jsonl")
+        let pt: JsonValue = pushes3.Get(pushes3.Count() - 1)
+        let ptp: JsonValue = pt.Get("payload")
+        ev = pg.Drain()
+        Program.Check("test : the phone confirms -> test-ok", pg.Receipt(Program.S(ptp, "id"), t0 + 2101500) && Program.Count(pg.Drain(), "test-ok", "", "marie") == 1)
+        pg.Tick(new List<Incident>(), t0 + 3700000)
+        ev = pg.Drain()
+        Program.Check("test : every test_every_s, on call and backup are tested", Program.Count(ev, "test", "", "karim") == 1 && Program.Count(ev, "test", "", "marie") == 1)
+    }
+}
