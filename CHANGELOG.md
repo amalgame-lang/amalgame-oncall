@@ -1,5 +1,17 @@
 # Changelog
 
+## v0.2.0 — 2026-11-20
+
+- SMS followed until delivered or failed (net-sms v0.2.0 `Status`) :
+  events `sms-delivered`, `sms-sent`, `sms-failed` (with the phone's
+  reason) ; an SMS the phone did not send within `fallback_s` is failed.
+  A failed SMS (or one refused by the gateway) : mail to the same person
+  if none went yet, and the next escalation step paged at once (`advance`),
+  unless that person's push was received. Found with a real phone : the
+  gateway accepted (202) while the phone lacked the SMS permission.
+- `page` of an SMS : `state` (`accepted` / `failed`) and `tracked`.
+- Tests : 51 checks.
+
 ## v0.1.0 — 2026-11-19
 
 - `OnCallPolicy` : levels, escalation steps, rota with roles, contacts,

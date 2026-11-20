@@ -12,6 +12,9 @@
 # appends {"device", "vapid_ok", "urgency", "payload"} to <dir>/push.jsonl
 # -> 201. /push/gone -> 410 (the subscription is gone).
 # POST /message : Basic sms:secret -> appends to <dir>/sms.jsonl -> 202 {"id"}.
+# GET /message/<id> : its state as the phone reports it : "Delivered" ;
+# "Failed" (no SMS permission) for a number listed in <dir>/sms_fail.txt ;
+# "Pending" forever (phone off) for one listed in <dir>/sms_stuck.txt.
 import base64, json, os, sys, time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from cryptography.hazmat.primitives import hashes, serialization
@@ -51,6 +54,13 @@ def serve(port, d):
     subs = json.load(open(os.path.join(d, 'subs.json')))
     origin = 'http://127.0.0.1:%d' % port
     sms_n = [0]
+    sms_to = {}
+
+    def listed(name, number):
+        try:
+            return number in open(os.path.join(d, name), encoding='utf-8').read().split()
+        except OSError:
+            return False
 
     def vapid_ok(h):
         try:
@@ -95,6 +105,20 @@ def serve(port, d):
             self.end_headers()
             self.wfile.write(body)
 
+        def do_GET(self):
+            mid = self.path[len('/message/'):] if self.path.startswith('/message/') else ''
+            if self.headers.get('Authorization') != 'Basic ' + base64.b64encode(b'sms:secret').decode():
+                return self.reply(401)
+            if mid not in sms_to:
+                return self.reply(404)
+            to = sms_to[mid]
+            r = {'phoneNumber': to, 'state': 'Delivered'}
+            if listed('sms_fail.txt', to):
+                r = {'phoneNumber': to, 'state': 'Failed', 'error': 'sendSMS: uid 10023 does not have android.permission.SEND_SMS.'}
+            elif listed('sms_stuck.txt', to):
+                r = {'phoneNumber': to, 'state': 'Pending'}
+            self.reply(200, json.dumps({'id': mid, 'state': r['state'], 'recipients': [r]}).encode())
+
         def do_POST(self):
             raw = self.rfile.read(int(self.headers.get('Content-Length', 0)))
             if self.path.startswith('/push/'):
@@ -116,6 +140,7 @@ def serve(port, d):
                     return self.reply(401)
                 m = json.loads(raw)
                 sms_n[0] += 1
+                sms_to['s-%d' % sms_n[0]] = m['phoneNumbers'][0]
                 with open(os.path.join(d, 'sms.jsonl'), 'a', encoding='utf-8') as f:
                     f.write(json.dumps({'to': m['phoneNumbers'][0], 'text': m['textMessage']['text']}, ensure_ascii=False) + '\n')
                 return self.reply(202, json.dumps({'id': 's-%d' % sms_n[0]}).encode())

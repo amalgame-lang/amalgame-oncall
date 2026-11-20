@@ -208,5 +208,80 @@ public class Program {
         pg.Tick(new List<Incident>(), t0 + 3700000)
         ev = pg.Drain()
         Program.Check("test : every test_every_s, on call and backup are tested", Program.Count(ev, "test", "", "karim") == 1 && Program.Count(ev, "test", "", "marie") == 1)
+
+        // ── SMS accepted is not SMS sent ──
+        // fake_services : a number in sms_fail.txt fails on the phone (no
+        // SMS permission) ; one in sms_stuck.txt stays pending (phone off).
+        File_WriteAll(dir + "/sms_fail.txt", "+33644444444\n")
+        File_WriteAll(dir + "/sms_stuck.txt", "+33655555555\n")
+
+        // A : the phone refuses to send.
+        let pa: Pager = new Pager(OnCallPolicy.Parse(Program.Pol("06 44 44 44 44", base)), vkey, vpub, "mailto:x@example.com", "test-secret-0123456789abcdef0123456789", t0)
+        let ia: Incident = new Incident("site|a|1", "crit", "La pompe P3 est en défaut.", "Station Sud", "/ui/astreinte.html#p3", t0)
+        let la: List<Incident> = new List<Incident>()
+        la.Add(ia)
+        pa.Tick(la, t0)
+        ev = pa.Drain()
+        Program.Check("A t+0 : no phone subscribed -> SMS to karim, accepted by the gateway, followed", Program.Count(ev, "page", "sms", "karim") == 1 && String.Contains(Program.Det(ev, 0), "\"state\":\"accepted\",\"tracked\":true"))
+        Program.Check("A t+0 : the SMS failed on the phone at once : sms-failed with the phone's reason", Program.Count(ev, "sms-failed", "", "karim") == 1 && String.Contains(Program.Det(ev, 2), "SEND_SMS"))
+        Program.Check("A t+0 : the next step (marie, at 600 s) is paged now, and why", Program.Count(ev, "advance", "", "karim") == 1 && Program.Count(ev, "page", "sms", "marie") == 1)
+        Program.Check("A t+0 : no second mail to karim (the fallback already tried one)", Program.Count(ev, "page", "mail", "karim") == 1)
+        pa.Tick(la, t0 + 10000)
+        ev = pa.Drain()
+        Program.Check("A t+10 s : marie's SMS is delivered ; nothing is paged twice", Program.Count(ev, "sms-delivered", "", "marie") == 1 && Program.Count(ev, "page", "", "") == 0)
+        pa.Tick(la, t0 + 700000)
+        ev = pa.Drain()
+        Program.Check("A t+600 s : the step brought forward is not paged again at its time", Program.Count(ev, "page", "", "") == 0)
+
+        // B : the phone never sends (off, no network).
+        let pb: Pager = new Pager(OnCallPolicy.Parse(Program.Pol("06 55 55 55 55", base)), vkey, vpub, "mailto:x@example.com", "test-secret-0123456789abcdef0123456789", t0)
+        let ib: Incident = new Incident("site|b|1", "crit", "Niveau bas.", "Bâche", "/ui/astreinte.html#b", t0)
+        let lb: List<Incident> = new List<Incident>()
+        lb.Add(ib)
+        pb.Tick(lb, t0)
+        pb.Drain()
+        pb.Tick(lb, t0 + 30000)
+        ev = pb.Drain()
+        Program.Check("B t+30 s : still pending, not yet a failure", Program.Count(ev, "sms-failed", "", "") == 0)
+        pb.Tick(lb, t0 + 61000)
+        ev = pb.Drain()
+        Program.Check("B t+61 s : not sent by the phone after fallback_s -> sms-failed, and marie paged now", Program.Count(ev, "sms-failed", "", "karim") == 1 && String.Contains(Program.Det(ev, 0), "not sent by the phone") && Program.Count(ev, "page", "sms", "marie") == 1)
+
+        // C : the gateway is down.
+        let pc: Pager = new Pager(OnCallPolicy.Parse(Program.Pol("06 11 11 11 11", "http://127.0.0.1:1")), vkey, vpub, "mailto:x@example.com", "test-secret-0123456789abcdef0123456789", t0)
+        let ic: Incident = new Incident("site|c|1", "crit", "Défaut.", "Station", "/ui/astreinte.html#c", t0)
+        let lc: List<Incident> = new List<Incident>()
+        lc.Add(ic)
+        pc.Tick(lc, t0)
+        ev = pc.Drain()
+        Program.Check("C t+0 : gateway unreachable : the SMS is failed, not followed, and marie is paged now", String.Contains(Program.Det(ev, 0), "\"ok\":false,\"state\":\"failed\",\"tracked\":false") && Program.Count(ev, "advance", "", "karim") == 1)
+
+        // D : a push received reached the person : a failed SMS changes nothing.
+        let pd: Pager = new Pager(OnCallPolicy.Parse(Program.Pol("06 44 44 44 44", base)), vkey, vpub, "mailto:x@example.com", "test-secret-0123456789abcdef0123456789", t0)
+        pd.AllowPrefix(base + "/push/")
+        pd.AddDevice("karim", base + "/push/d1", Program.S(d1, "p256dh"), Program.S(d1, "auth"), "Fairphone", t0)
+        let idd: Incident = new Incident("site|d|1", "crit", "Défaut D.", "Station", "/ui/astreinte.html#d", t0)
+        let ld: List<Incident> = new List<Incident>()
+        ld.Add(idd)
+        pd.Tick(ld, t0)
+        let pushesD: List<JsonValue> = Program.Lines(dir + "/push.jsonl")
+        let pdl: JsonValue = pushesD.Get(pushesD.Count() - 1)
+        let pdp: JsonValue = pdl.Get("payload")
+        pd.Receipt(Program.S(pdp, "id"), t0 + 2000)
+        pd.SmsTo("karim", "x", idd.Key, 0, false, t0 + 3000)
+        pd.Drain()
+        pd.Tick(ld, t0 + 9000)
+        ev = pd.Drain()
+        Program.Check("D : push received, SMS failed : journaled, but no step brought forward", Program.Count(ev, "sms-failed", "", "karim") == 1 && Program.Count(ev, "advance", "", "") == 0)
+    }
+
+    // On call karim (phone given), backup marie (delivered), backup step at 600 s.
+    public static string Pol(phone: string, gw: string) {
+        return "{\"levels\":[\"crit\"],"
+            + "\"steps\":[{\"after_s\":0,\"to\":\"oncall\",\"via\":[\"push\"]},{\"after_s\":600,\"to\":\"backup\",\"via\":[\"push\",\"sms\"]}],"
+            + "\"fallback_s\":60,"
+            + "\"rota\":[{\"from\":\"2026-01-01T00:00:00Z\",\"oncall\":\"karim\",\"backup\":\"marie\"}],"
+            + "\"contacts\":{\"karim\":{\"phone\":\"" + phone + "\"},\"marie\":{\"phone\":\"06 22 22 22 22\"}},"
+            + "\"country\":\"33\",\"sms\":{\"kind\":\"sms-gate\",\"url\":\"" + gw + "\",\"user\":\"sms\",\"password\":\"secret\"}}"
     }
 }

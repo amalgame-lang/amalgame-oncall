@@ -349,6 +349,10 @@ public class Pager {
     public Pend: Map<string, List<string>>    // push id -> [key, login, sentMs, kind, device name]
     public Rx: Map<string, string>            // push id, "key|login" -> ms
     public Paged: Map<string, string>         // key -> ",login,login,"
+    public SmsPend: Map<string, List<string>> // SMS id -> [key, login, sentMs, step, state] : followed until delivered or failed
+    public SmsPollMs: int                     // how often the gateway is asked (default 5 s)
+    public LastSmsPoll: int
+    public PendingFail: List<string>          // key, login, step (one per line) : SMS failures to act on at the next Tick
     public Events: List<OnCallEvent>
     public LastAutoTest: int
 
@@ -376,6 +380,10 @@ public class Pager {
         this.Pend = new Map<string, List<string>>()
         this.Rx = new Map<string, string>()
         this.Paged = new Map<string, string>()
+        this.SmsPend = new Map<string, List<string>>()
+        this.SmsPollMs = 5000
+        this.LastSmsPoll = 0
+        this.PendingFail = new List<string>()
         this.Events = new List<OnCallEvent>()
         this.LastAutoTest = nowMs
     }
@@ -603,13 +611,125 @@ public class Pager {
             err = r.Error
             id = r.Id
         }
+        // Accepted by the gateway is not sent : followed (sms-delivered,
+        // sms-sent, sms-failed) when the gateway can say.
+        var state: string = "failed"
+        if (ok) { state = "accepted" }
+        let tracked: bool = ok && String.Length(id) > 0 && this.Policy.Sms.CanTrack()
+        if (tracked) {
+            let row: List<string> = new List<string>()
+            row.Add(key)
+            row.Add(login)
+            row.Add(String.FromInt(nowMs))
+            row.Add(String.FromInt(step))
+            row.Add("accepted")
+            Threading.MutexLock(this.Mu)
+            this.SmsPend.Set(id, row)
+            Threading.MutexUnlock(this.Mu)
+        }
         this.Emit("page", key, login, "{\"step\":" + String.FromInt(step) + ",\"to\":" + Pager.J(login) + ",\"via\":\"sms\",\"fallback\":" + Pager.B(fallback)
-            + ",\"phone\":" + Pager.J(phone) + ",\"ok\":" + Pager.B(ok) + ",\"code\":" + String.FromInt(code) + ",\"id\":" + Pager.J(id) + ",\"error\":" + Pager.J(err) + "}", nowMs)
+            + ",\"phone\":" + Pager.J(phone) + ",\"ok\":" + Pager.B(ok) + ",\"state\":" + Pager.J(state) + ",\"tracked\":" + Pager.B(tracked)
+            + ",\"code\":" + String.FromInt(code) + ",\"id\":" + Pager.J(id) + ",\"error\":" + Pager.J(err) + "}", nowMs)
+        if (!ok && !String.StartsWith(key, "test|")) { this.SmsFailed(key, login, step, nowMs) }
         return ok
+    }
+
+    // An SMS that did not leave (refused by the gateway, or failed on the
+    // phone) : the person was not reached. Mail now if not already sent
+    // for this incident, and the next escalation step now instead of at
+    // its time. Done at most once per incident and person.
+    public void SmsFailed(key: string, login: string, step: int, nowMs: int) {
+        let dk: string = "smsfail|" + key + "|" + login
+        if (this.Done.Has(dk) || this.Done.Has("taken|" + key)) { return }
+        this.Done.Set(dk, "1")
+        this.PendingFail.Add(key + "\n" + login + "\n" + String.FromInt(step))
+    }
+
+    // Asks the gateway where each followed SMS is (every SmsPollMs).
+    // delivered -> sms-delivered ; failed -> sms-failed and SmsFailed ;
+    // still not sent by the phone after fallback_s -> sms-failed (phone
+    // off, no network, no permission) ; sent but no delivery report after
+    // 10 min -> sms-sent (the operator gives none), no longer followed.
+    public void FollowSms(nowMs: int) {
+        if (nowMs - this.LastSmsPoll < this.SmsPollMs) { return }
+        this.LastSmsPoll = nowMs
+        if (this.Policy.Sms == null) { return }
+        Threading.MutexLock(this.Mu)
+        let ids: List<string> = this.SmsPend.Keys()
+        Threading.MutexUnlock(this.Mu)
+        for idv in ids {
+            let id: string = idv
+            Threading.MutexLock(this.Mu)
+            let row: List<string> = this.SmsPend.Get(id)
+            Threading.MutexUnlock(this.Mu)
+            let key: string = row.Get(0)
+            let login: string = row.Get(1)
+            let sent: int = String.ToInt(row.Get(2))
+            let step: int = String.ToInt(row.Get(3))
+            var was: string = row.Get(4)
+            if (this.Done.Has("smssent|" + id)) { was = "sent" }
+            let st: SmsStatus = this.Policy.Sms.Status(id)
+            let state: string = st.State
+            let age: int = nowMs - sent
+            var ev: string = ""
+            var why: string = st.Error
+            if (state == "delivered") { ev = "sms-delivered" }
+            else if (state == "failed") { ev = "sms-failed" }
+            else if (state == "sent") {
+                if (age >= 600000) { ev = "sms-sent" }
+                else if (was != "sent") { this.Done.Set("smssent|" + id, "1") }
+            } else if (was != "sent" && age >= this.Policy.FallbackS * 1000) {
+                ev = "sms-failed"
+                if (state == "pending") { why = "not sent by the phone after " + String.FromInt(age / 1000) + " s (phone off, no network, no SMS permission ?)" }
+                else { why = "no state after " + String.FromInt(age / 1000) + " s : " + st.Error }
+            } else if (was == "sent" && age >= 600000) { ev = "sms-sent" }
+            if (String.Length(ev) > 0) {
+                Threading.MutexLock(this.Mu)
+                this.SmsPend.Remove(id)
+                Threading.MutexUnlock(this.Mu)
+                this.Emit(ev, key, login, "{\"id\":" + Pager.J(id) + ",\"state\":" + Pager.J(state) + ",\"raw\":" + Pager.J(st.Raw)
+                    + ",\"after_ms\":" + String.FromInt(age) + ",\"error\":" + Pager.J(why) + "}", nowMs)
+                if (ev == "sms-failed" && !String.StartsWith(key, "test|")) { this.SmsFailed(key, login, step, nowMs) }
+            }
+        }
+    }
+
+    // The failures found : mail to the same person (if no mail went for
+    // this incident yet), and the next escalation step now.
+    public void ActOnSmsFailures(open: Map<string, Incident>, nowMs: int) {
+        let todo: List<string> = this.PendingFail
+        this.PendingFail = new List<string>()
+        for t in todo {
+            let parts: List<string> = String.Split(t, "\n")
+            let key: string = parts.Get(0)
+            let login: string = parts.Get(1)
+            Threading.MutexLock(this.Mu)
+            let reached: bool = this.Rx.Has(key + "|" + login)
+            Threading.MutexUnlock(this.Mu)
+            // A push that arrived reached the person : nothing to make up for.
+            if (open.Has(key) && !reached) {
+                let inc: Incident = open.Get(key)
+                if (!this.Done.Has("mail|" + key + "|" + login)) {
+                    this.MailTo(login, inc.Title, inc.Title + "\n" + inc.Body + "\n" + this.Policy.PublicUrl + inc.Url, key, -1, true, nowMs)
+                }
+                let ns: int = this.Policy.Steps.Count()
+                var next: int = -1
+                for i in 0..ns {
+                    let dk: string = key + "|" + String.FromInt(i)
+                    if (next < 0 && !this.Done.Has(dk)) { next = i }
+                }
+                if (next >= 0) {
+                    this.Done.Set(key + "|" + String.FromInt(next), "1")
+                    this.Emit("advance", key, login, "{\"step\":" + String.FromInt(next) + ",\"why\":\"SMS to " + SmsEscape.Json(login) + " failed\"}", nowMs)
+                    this.Page(inc, next, nowMs)
+                }
+            }
+        }
     }
 
     public bool MailTo(login: string, subject: string, body: string, key: string, step: int, fallback: bool, nowMs: int) {
         let to: string = this.Policy.Contact(login, "email")
+        this.Done.Set("mail|" + key + "|" + login, "1")
         var ok: bool = false
         var err: string = ""
         if (String.Length(this.Policy.SmtpHost) == 0) { err = "no SMTP server" }
@@ -793,6 +913,9 @@ public class Pager {
                 this.SmsTo(login, this.DeadPhoneSms + dn, key, -1, true, nowMs)
             }
         }
+        // SMS : where they are, and what to do when one did not leave.
+        this.FollowSms(nowMs)
+        this.ActOnSmsFailures(open, nowMs)
         // Periodic phone tests : on call and backup.
         if (this.Policy.TestEveryS > 0 && nowMs - this.LastAutoTest >= this.Policy.TestEveryS * 1000) {
             this.LastAutoTest = nowMs

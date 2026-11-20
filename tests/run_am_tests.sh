@@ -54,7 +54,7 @@ cd "$WORK"
 : > amalgame.toml
 # net-sms and net-webpush v0.1.2 by their full URL : before (and after) their index entries.
 for dep in crypto@v0.8.0 tls net-http@v0.29.6 threading@v0.1.0 datetime@v0.2.2 net-smtp@v0.2.7 \
-           github.com/amalgame-lang/amalgame-net-webpush@v0.1.2 github.com/amalgame-lang/amalgame-net-sms@v0.1.0; do
+           github.com/amalgame-lang/amalgame-net-webpush@v0.1.2 github.com/amalgame-lang/amalgame-net-sms@v0.2.0; do
     "$AMC" package add "$dep" >/dev/null 2>&1 || { echo "cannot install $dep" >&2; exit 1; }
 done
 cat >> amalgame.toml <<TOML

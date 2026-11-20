@@ -9,9 +9,9 @@
 
 [package]
 name              = "amalgame-oncall"
-version           = "0.1.0"
+version           = "0.2.0"
 license           = "Apache-2.0"
-description       = "On-call paging: a rota, escalation steps (after how long, to whom, by push / SMS / mail) until someone takes the incident; per-push delivery receipts, with an SMS + mail fallback for a push not received in time; signed take tokens to take an incident from the lock screen without a session; periodic phone tests; the paged told who took it. Storage-agnostic (incidents in, events out, Restore after a restart). Ships the phone's service worker (web/oncall-sw.js). Over net-webpush, net-sms and net-smtp."
+description       = "On-call paging: a rota, escalation steps (after how long, to whom, by push / SMS / mail) until someone takes the incident; per-push delivery receipts, with an SMS + mail fallback for a push not received in time; every SMS followed until delivered or failed, a failed one bringing the next step forward; signed take tokens to take an incident from the lock screen without a session; periodic phone tests; the paged told who took it. Storage-agnostic (incidents in, events out, Restore after a restart). Ships the phone's service worker (web/oncall-sw.js). Over net-webpush, net-sms and net-smtp."
 authors           = ["Bastien Mouget"]
 required-amalgame = ">=0.8.58"
 schema-version    = 1
@@ -24,7 +24,7 @@ facade    = "facade.am"
 
 [dependencies]
 amalgame-net-webpush = ">=0.1.2"
-amalgame-net-sms     = ">=0.1.0"
+amalgame-net-sms     = ">=0.2.0"
 amalgame-net-smtp    = ">=0.2.7"
 amalgame-crypto      = ">=0.8.0"
 amalgame-threading   = ">=0.1.0"

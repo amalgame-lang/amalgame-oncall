@@ -15,6 +15,14 @@ a word. Here the proof of reach is the take-over :
   `fallback_s` goes again **by SMS and mail to the same person, at once**,
   without waiting for the next step. A person without a working device
   gets the SMS straight away.
+- **An SMS accepted is not an SMS sent** : the gateway's 202 only means
+  queued. Every SMS is followed with the gateway (SMS Gateway for
+  Android, Twilio) until delivered or failed ; one that failed on the
+  phone (no SMS permission, no network), or that the phone has not sent
+  within `fallback_s`, is journaled `sms-failed` with the reason, the
+  person gets the mail if none went yet, and **the next escalation step
+  is paged at once** instead of at its time — unless a push to that
+  person was received (they were reached).
 - **Take it from the lock screen** : every alarm push carries a signed
   take token (HMAC-SHA-256 ; one person, one incident, 6 h). The
   "take it" button posts it : no login at 3 a.m. The caller checks it
@@ -92,6 +100,8 @@ silent.
 |---|---|
 | `page` | one send : `step`, `to`, `via` (push, sms, mail), `ok`, `code`, `fallback`, `device` / `phone` / `email`, `id`, `error` |
 | `rx` | a push arrived : `id`, `device`, `after_ms` |
+| `sms-delivered`, `sms-sent`, `sms-failed` | where a followed SMS ended : `id`, `state`, `raw` (the gateway's word), `after_ms`, `error` (why it failed). The `page` of an SMS says `state` (`accepted` or `failed`) and `tracked` |
+| `advance` | an escalation step paged before its time : `step`, `why` |
 | `taken` | the paged were told who took it : `by`, `told` |
 | `device-expired` | the push service dropped a subscription (404/410) : delete it |
 | `test`, `test-ok`, `test-failed` | phone tests |
@@ -113,7 +123,7 @@ on the home screen) shows no buttons : touching opens the page.
 ./tests/run_am_tests.sh [amc]      # python3 + cryptography, openssl
 ```
 
-41 checks over a whole escalation with simulated time, against stand-in
+51 checks over a whole escalation with simulated time, against stand-in
 services (`tests/fake_services.py`) : a push service that **checks the
 VAPID signature and decrypts every push with the phone's private key**
 (RFC 8291), and an SMS gateway. Policy errors, rota, refused endpoints,
@@ -121,7 +131,11 @@ step 0, dropped subscription, SMS fallback for a push not received,
 receipt with its delay, take tokens (valid, forged login, expired,
 another server's secret), take-over and the paged told, no escalation
 after it, a full escalation to the manager, restart without paging
-again, phone tests (failed with SMS, confirmed, periodic).
+again, phone tests (failed with SMS, confirmed, periodic). SMS followed : failed
+on the phone with its reason (next step paged at once, not again at its
+time, no second mail), never sent by the phone (failed after
+`fallback_s`), gateway down, and a failed SMS to someone whose push
+arrived (journaled, nothing brought forward).
 
 ## Dependencies
 
