@@ -340,6 +340,8 @@ public class Pager {
     public TestBody: string
     public DeadPhoneSms: string  // + device name : SMS when a test push did not arrive
     public TokenMs: int          // validity of a take token
+    public Icon: string          // URL of the notification icon ("" : the browser's)
+    public Badge: string         // URL of the status-bar badge (Android, monochrome)
     public StartedMs: int
     public Devices: List<OnCallDevice>
     public Names: Map<string, string>
@@ -371,6 +373,8 @@ public class Pager {
         this.TestBody = "This phone receives the on-call alerts."
         this.DeadPhoneSms = "On-call : a test notification did not reach your phone : "
         this.TokenMs = 6 * 3600000
+        this.Icon = ""
+        this.Badge = ""
         this.StartedMs = nowMs
         this.Devices = new List<OnCallDevice>()
         this.Names = new Map<string, string>()
@@ -565,9 +569,12 @@ public class Pager {
             }
             var tag: string = key
             if (kind == "test") { tag = "oncall-test" }
+            var art: string = ""
+            if (String.Length(this.Icon) > 0) { art = art + ",\"icon\":" + Pager.J(this.Icon) }
+            if (String.Length(this.Badge) > 0) { art = art + ",\"badge\":" + Pager.J(this.Badge) }
             let payload: string = "{\"id\":" + Pager.J(id) + ",\"kind\":" + Pager.J(kind) + ",\"tag\":" + Pager.J(tag)
                 + ",\"title\":" + Pager.J(title) + ",\"body\":" + Pager.J(body) + ",\"url\":" + Pager.J(url)
-                + ",\"rx\":" + Pager.J(this.RxUrl) + ",\"openLabel\":" + Pager.J(this.OpenLabel) + take + "}"
+                + ",\"rx\":" + Pager.J(this.RxUrl) + ",\"openLabel\":" + Pager.J(this.OpenLabel) + take + art + "}"
             let sub: PushSubscription = new PushSubscription(d.Endpoint, d.P256dh, d.Auth)
             let res: WebPushResult = WebPush.Send(sub, payload, this.VapidKey, this.VapidPub, this.Subject)
             let code: int = res.StatusCode

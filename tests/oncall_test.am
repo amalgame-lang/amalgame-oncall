@@ -88,6 +88,7 @@ public class Program {
         pg.Names.Set("karim", "Karim Benali")
         pg.TakenPrefix = "Pris en charge par "
         pg.DeadPhoneSms = "Kairos : ton telephone ne recoit pas les alarmes : "
+        pg.Icon = "/ui/icons/kairos-192.png"
         let subs: JsonResult = Json.Parse(File_ReadAll(dir + "/subs.json"))
         let sv: JsonValue = subs.Value
         let d1: JsonValue = sv.Get("d1")
@@ -117,7 +118,7 @@ public class Program {
         let pay: JsonValue = p0.Get("payload")
         let vo: JsonValue = p0.Get("vapid_ok")
         Program.Check("the push is signed (VAPID ES256, audience, expiry) and urgent", vo.AsString() == "ok" && Program.S(p0, "urgency") == "high")
-        Program.Check("the push says what happened, with its tag and link", Program.S(pay, "title") == "La pompe P2 est en défaut." && Program.S(pay, "tag") == i1.Key && Program.S(pay, "url") == "/ui/astreinte.html#p2" && Program.S(pay, "kind") == "alarm")
+        Program.Check("the push says what happened, with its tag, link and icon", Program.S(pay, "title") == "La pompe P2 est en défaut." && Program.S(pay, "tag") == i1.Key && Program.S(pay, "url") == "/ui/astreinte.html#p2" && Program.S(pay, "kind") == "alarm" && Program.S(pay, "icon") == "/ui/icons/kairos-192.png" && !pay.Has("badge"))
         let token: string = Program.S(pay, "take")
         let pushId: string = Program.S(pay, "id")
         Program.Check("the push carries a take token and a receipt id", String.Length(token) > 64 && String.Length(pushId) == 32)

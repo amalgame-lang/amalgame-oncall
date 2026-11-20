@@ -112,7 +112,10 @@ silent.
 notification (an alarm stays until touched, vibrates, replaces the
 previous one of the same incident), "take it" and "open", renewal of a
 subscription (`pushsubscriptionchange`). Serve it from the app's origin
-over HTTPS, register it with `?sub=<subscribe URL>`. Payload labels
+over HTTPS, register it with `?sub=<subscribe URL>` (and `&h=<header>` if
+the app requires a header on its POSTs, sent with the value 1 when a
+renewed subscription is posted). `Pager.Icon` and `Pager.Badge` set the
+notification's icon and status-bar badge. Payload labels
 (`takeLabel`, `openLabel`) and the take answer (`{title, body}`) come
 from the server : the language is the app's. iOS (16.4+, app installed
 on the home screen) shows no buttons : touching opens the page.

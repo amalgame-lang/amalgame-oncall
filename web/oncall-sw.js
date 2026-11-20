@@ -3,6 +3,10 @@
 // Register it from the app's page (same origin, HTTPS) :
 //   navigator.serviceWorker.register('oncall-sw.js?sub=' + encodeURIComponent('/api/oncall/subscribe'))
 // `sub` is where a renewed subscription is posted (pushsubscriptionchange).
+// `h` (optional) : a header the app requires on its POSTs against cross-site
+// requests (e.g. h=X-Kairos), sent with the value 1 on that renewal ;
+// without it, an app that checks one would refuse the renewal and the
+// phone would stop receiving alarms silently.
 //
 // On a push (the payload Pager.PushTo builds) :
 //   - confirms the arrival to `rx` with the push id : the server's delivery
@@ -17,10 +21,10 @@
 self.addEventListener('install', () => self.skipWaiting());
 self.addEventListener('activate', (event) => event.waitUntil(self.clients.claim()));
 
-function post(url, body, withCookies) {
+function post(url, body, withCookies, extra) {
   return fetch(url, {
     method: 'POST',
-    headers: {'Content-Type': 'application/json'},
+    headers: Object.assign({'Content-Type': 'application/json'}, extra || {}),
     body: JSON.stringify(body),
     credentials: withCookies ? 'same-origin' : 'omit',
   });
@@ -82,11 +86,13 @@ self.addEventListener('notificationclick', (event) => {
 
 // The push service renewed the subscription : give the new one to the server.
 self.addEventListener('pushsubscriptionchange', (event) => {
-  const sub = new URL(self.location.href).searchParams.get('sub');
+  const q = new URL(self.location.href).searchParams;
+  const sub = q.get('sub');
+  const h = q.get('h');
   const old = event.oldSubscription;
   if (!sub || !old || !old.options) return;
   event.waitUntil(self.registration.pushManager.subscribe(old.options).then((s) => {
     const j = s.toJSON();
-    return post(sub, {endpoint: j.endpoint, p256dh: j.keys.p256dh, auth: j.keys.auth, device: 'renewed', replaces: old.endpoint}, true);
+    return post(sub, {endpoint: j.endpoint, p256dh: j.keys.p256dh, auth: j.keys.auth, device: 'renewed', replaces: old.endpoint}, true, h ? {[h]: '1'} : null);
   }).catch(() => {}));
 });

@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.2.1 — 2026-11-20
+
+- `web/oncall-sw.js` : `h=<header>` in the registration URL, sent (value 1)
+  when the worker posts a renewed subscription. An app that requires a
+  header against cross-site requests refused the renewal : the phone
+  stopped receiving alarms without anyone knowing.
+- `Pager.Icon`, `Pager.Badge` : the notification's icon and status-bar
+  badge, in every push.
+
 ## v0.2.0 — 2026-11-20
 
 - SMS followed until delivered or failed (net-sms v0.2.0 `Status`) :

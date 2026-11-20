@@ -9,7 +9,7 @@
 
 [package]
 name              = "amalgame-oncall"
-version           = "0.2.0"
+version           = "0.2.1"
 license           = "Apache-2.0"
 description       = "On-call paging: a rota, escalation steps (after how long, to whom, by push / SMS / mail) until someone takes the incident; per-push delivery receipts, with an SMS + mail fallback for a push not received in time; every SMS followed until delivered or failed, a failed one bringing the next step forward; signed take tokens to take an incident from the lock screen without a session; periodic phone tests; the paged told who took it. Storage-agnostic (incidents in, events out, Restore after a restart). Ships the phone's service worker (web/oncall-sw.js). Over net-webpush, net-sms and net-smtp."
 authors           = ["Bastien Mouget"]
