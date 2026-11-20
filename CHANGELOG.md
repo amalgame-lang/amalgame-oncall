@@ -1,5 +1,18 @@
 # Changelog
 
+## v0.3.0 — 2026-11-20
+
+- Received is not seen : `ack_s` (default 180, 0 : off) — a push that
+  arrived but was not taken by then goes by SMS and mail to the same
+  person (`not-taken`), before the next step. Found with a real phone :
+  Chrome on Android hid an alarm as "Possible spam" while the receipt
+  came back.
+- `Pager.Dismissed` and the service worker's `notificationclose` : an
+  alarm swiped away without being taken is journaled (`dismissed`).
+- README : writing alarms that a spam filter does not take for spam ;
+  how a withdrawn permission is found (`device-expired`, `test-failed`).
+- Tests : 58 checks.
+
 ## v0.2.1 — 2026-11-20
 
 - `web/oncall-sw.js` : `h=<header>` in the registration URL, sent (value 1)

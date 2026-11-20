@@ -73,6 +73,7 @@ pager.Test("karim", nowMs)                   // "test my phone"
     {"after_s": 1200, "to": "manager", "via": ["sms", "mail"]}
   ],
   "fallback_s": 60,
+  "ack_s": 180,
   "test_every_s": 86400,
   "rota": [{"from": "2026-11-16T07:00:00Z", "oncall": "karim", "backup": "marie", "manager": "paul"}],
   "contacts": {"karim": {"phone": "06 12 34 56 78", "email": "karim@example.com"}},
@@ -94,6 +95,11 @@ SMS are transliterated to GSM 7-bit and cut to one SMS. Mail : SMTPS
 (no gateway, no number) is still an event, with its reason : never
 silent.
 
+`fallback_s` : a push not **received** by then goes by SMS and mail to the
+same person. `ack_s` (default 180, 0 : off) : a push received but not
+**taken** by then goes by SMS and mail too, before the next step —
+received is not seen (below).
+
 ## Events (`Drain`)
 
 | Kind | Detail |
@@ -102,6 +108,8 @@ silent.
 | `rx` | a push arrived : `id`, `device`, `after_ms` |
 | `sms-delivered`, `sms-sent`, `sms-failed` | where a followed SMS ended : `id`, `state`, `raw` (the gateway's word), `after_ms`, `error` (why it failed). The `page` of an SMS says `state` (`accepted` or `failed`) and `tracked` |
 | `advance` | an escalation step paged before its time : `step`, `why` |
+| `not-taken` | a push was received but not taken within `ack_s` : `received_ms`, `after_s` ; SMS and mail follow |
+| `dismissed` | the person swiped the alarm away without taking it : `id`, `device`, `after_ms` (the escalation goes on) |
 | `taken` | the paged were told who took it : `by`, `told` |
 | `device-expired` | the push service dropped a subscription (404/410) : delete it |
 | `test`, `test-ok`, `test-failed` | phone tests |
@@ -118,7 +126,31 @@ renewed subscription is posted). `Pager.Icon` and `Pager.Badge` set the
 notification's icon and status-bar badge. Payload labels
 (`takeLabel`, `openLabel`) and the take answer (`{title, body}`) come
 from the server : the language is the app's. iOS (16.4+, app installed
-on the home screen) shows no buttons : touching opens the page.
+on the home screen) shows no buttons : touching opens the page. An alarm
+swiped away (`notificationclose`) is posted to `rx` with
+`{"id", "event": "dismissed"}` : the caller passes it to `Pager.Dismissed`.
+
+### Received is not seen
+
+A delivery receipt proves the phone got the push, not that a person saw
+it. Found with a real phone : Chrome on Android (since 2025) runs an
+on-device model on the title, body and button texts of web notifications
+and may replace one with "Possible spam", the content hidden behind a
+tap ; the receipt came back all the same. Do not disturb, a phone in a
+pocket or a muted channel do the same. Hence :
+
+- only the take-over stops the escalation ; a received alarm not taken
+  within `ack_s` goes by SMS and mail to the same person ;
+- write alarms as plain facts — equipment, fault, place
+  ("La pompe P2 est en défaut." / "Station de pompage Nord · depuis
+  10:02") — without urgency words, capitals, exclamation marks or
+  imitations of system alerts, and serve the app from its real HTTPS
+  name, not a development address : the model's criteria are not
+  published, this lowers the risk, nothing guarantees it ;
+- Chrome may also withdraw a site's notification permission ; the push
+  subscription then fails (`device-expired`) or the periodic test push
+  does not come back (`test-failed`, and an SMS) : with
+  `test_every_s` = 86400 a silent phone is known within a day.
 
 ## Tests
 
@@ -126,12 +158,13 @@ on the home screen) shows no buttons : touching opens the page.
 ./tests/run_am_tests.sh [amc]      # python3 + cryptography, openssl
 ```
 
-51 checks over a whole escalation with simulated time, against stand-in
+58 checks over a whole escalation with simulated time, against stand-in
 services (`tests/fake_services.py`) : a push service that **checks the
 VAPID signature and decrypts every push with the phone's private key**
 (RFC 8291), and an SMS gateway. Policy errors, rota, refused endpoints,
 step 0, dropped subscription, SMS fallback for a push not received,
-receipt with its delay, take tokens (valid, forged login, expired,
+receipt with its delay, received but not taken within `ack_s` (SMS and
+mail before the next step, once), an alarm swiped away, take tokens (valid, forged login, expired,
 another server's secret), take-over and the paged told, no escalation
 after it, a full escalation to the manager, restart without paging
 again, phone tests (failed with SMS, confirmed, periodic). SMS followed : failed

@@ -39,6 +39,9 @@ import Amalgame.Net.Smtp
 //              {"after_s": 600,  "to": "backup",  "via": ["push", "sms", "mail"]},
 //              {"after_s": 1200, "to": "manager", "via": ["sms", "mail"]} ],
 //   "fallback_s": 60,                          push not received : SMS + mail now
+//   "ack_s": 180,                              push received but not taken : SMS + mail
+//                                              then (received is not seen : the phone
+//                                              may hide it, Chrome's spam filter does) ; 0 : off
 //   "test_every_s": 86400,                     test push to oncall and backup
 //   "rota": [ {"from": "2026-11-16T07:00:00Z", "oncall": "karim", "backup": "marie", "manager": "paul"} ],
 //   "contacts": {"karim": {"phone": "06 12 34 56 78", "email": "karim@example.com"}},
@@ -78,6 +81,7 @@ public class OnCallPolicy {
     public Levels: List<string>
     public Steps: List<OnCallStep>
     public FallbackS: int
+    public AckS: int
     public TestEveryS: int
     public RotaFrom: List<string>      // ms, as strings (List<int> loops are untyped)
     public Rota: List<JsonValue>
@@ -97,6 +101,7 @@ public class OnCallPolicy {
         this.Levels = new List<string>()
         this.Steps = new List<OnCallStep>()
         this.FallbackS = 60
+        this.AckS = 180
         this.TestEveryS = 0
         this.RotaFrom = new List<string>()
         this.Rota = new List<JsonValue>()
@@ -149,6 +154,11 @@ public class OnCallPolicy {
         if (ns == 0) { p.Errors.Add("no step") }
         let fb: JsonValue = root.Get("fallback_s")
         if (fb.AsInt() > 0) { p.FallbackS = fb.AsInt() }
+        if (root.Has("ack_s")) {
+            let ak: JsonValue = root.Get("ack_s")
+            p.AckS = ak.AsInt()
+            if (p.AckS < 0) { p.Errors.Add("ack_s < 0") }
+        }
         let te: JsonValue = root.Get("test_every_s")
         p.TestEveryS = te.AsInt()
         let rota: JsonValue = root.Get("rota")
@@ -825,6 +835,29 @@ public class Pager {
         return true
     }
 
+    // The phone says an alarm notification was swiped away without being
+    // taken (the service worker's notificationclose). Journaled ; the
+    // escalation goes on. false : unknown id.
+    public bool Dismissed(id: string, nowMs: int) {
+        Threading.MutexLock(this.Mu)
+        if (!this.Pend.Has(id)) {
+            Threading.MutexUnlock(this.Mu)
+            return false
+        }
+        let pv: List<string> = this.Pend.Get(id)
+        let key: string = pv.Get(0)
+        let login: string = pv.Get(1)
+        let sent: string = pv.Get(2)
+        let dn: string = pv.Get(4)
+        let first: bool = !this.Done.Has("dis|" + id)
+        this.Done.Set("dis|" + id, "1")
+        Threading.MutexUnlock(this.Mu)
+        if (first) {
+            this.Emit("dismissed", key, login, "{\"id\":" + Pager.J(id) + ",\"device\":" + Pager.J(dn) + ",\"after_ms\":" + String.FromInt(nowMs - String.ToInt(sent)) + "}", nowMs)
+        }
+        return true
+    }
+
     // After a restart : what the journal says was already done.
     public void Restore(key: string, step: int, login: string) {
         this.Done.Set(key + "|" + String.FromInt(step), "1")
@@ -918,6 +951,30 @@ public class Pager {
                 this.Done.Set("tf|" + key, "1")
                 this.Emit("test-failed", key, login, "{\"id\":" + Pager.J(id) + ",\"device\":" + Pager.J(dn) + "}", nowMs)
                 this.SmsTo(login, this.DeadPhoneSms + dn, key, -1, true, nowMs)
+            }
+        }
+        // Received is not seen : a push that arrived but was not taken within
+        // ack_s (the phone may hide it : Chrome's spam filter, do not disturb,
+        // a pocket) goes again by SMS and mail to the same person.
+        if (this.Policy.AckS > 0) {
+            let oks: List<string> = open.Keys()
+            for okv in oks {
+                let key: string = okv
+                if (this.Paged.Has(key)) {
+                    let logins: List<string> = String.Split(this.Paged.Get(key), ",")
+                    for l in logins {
+                        let lg: string = l
+                        Threading.MutexLock(this.Mu)
+                        var rxAt: int = -1
+                        if (this.Rx.Has(key + "|" + lg)) { rxAt = String.ToInt(this.Rx.Get(key + "|" + lg)) }
+                        Threading.MutexUnlock(this.Mu)
+                        if (String.Length(lg) > 0 && rxAt >= 0 && nowMs - rxAt >= this.Policy.AckS * 1000 && !this.Done.Has("fb|" + key + "|" + lg)) {
+                            let inc: Incident = open.Get(key)
+                            this.Emit("not-taken", key, lg, "{\"received_ms\":" + String.FromInt(rxAt) + ",\"after_s\":" + String.FromInt((nowMs - rxAt) / 1000) + ",\"ack_s\":" + String.FromInt(this.Policy.AckS) + "}", nowMs)
+                            this.Fallback(inc, lg, -1, nowMs)
+                        }
+                    }
+                }
             }
         }
         // SMS : where they are, and what to do when one did not leave.

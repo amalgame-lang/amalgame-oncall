@@ -84,6 +84,13 @@ self.addEventListener('notificationclick', (event) => {
   }));
 });
 
+// An alarm swiped away without being taken : the server journals it
+// (the escalation goes on until someone takes the alarm).
+self.addEventListener('notificationclose', (event) => {
+  const p = event.notification.data || {};
+  if (p.kind === 'alarm' && p.id && p.rx) event.waitUntil(post(p.rx, {id: p.id, event: 'dismissed'}, false).catch(() => {}));
+});
+
 // The push service renewed the subscription : give the new one to the server.
 self.addEventListener('pushsubscriptionchange', (event) => {
   const q = new URL(self.location.href).searchParams;
